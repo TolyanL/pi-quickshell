@@ -1,0 +1,47 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import activate from './index.ts';
+
+test('pi lifecycle → per-process record → bar snapshot', t => {
+  const runtime = mkdtempSync(join(tmpdir(), 'pi-qs-test-'));
+  const original = process.env.XDG_RUNTIME_DIR;
+  process.env.XDG_RUNTIME_DIR = runtime;
+  t.after(() => {
+    rmSync(runtime, {recursive: true, force: true});
+    if (original) process.env.XDG_RUNTIME_DIR = original; else delete process.env.XDG_RUNTIME_DIR;
+  });
+  const pi = new EventEmitter();
+  const bus = new EventEmitter();
+  pi.events = { on(name, fn) { bus.on(name, fn); return () => bus.off(name, fn); } };
+  pi.getSessionName = () => 'main';
+  activate(pi);
+  const snapshot = () => JSON.parse(execFileSync('python3', [new URL('./pi-agents.py', import.meta.url).pathname]));
+  pi.emit('session_start', {}, {cwd:'/test'});
+  writeFileSync(join(runtime, 'pi-quickshell', '1.json'), '{"start":"invalid"}');
+  assert.deepEqual(snapshot(), {state:'idle', rows:[{name:'main',state:'idle',depth:0}]});
+  pi.emit('agent_start');
+  assert.equal(snapshot().state, 'working');
+  pi.emit('ui_prompt_start');
+  pi.emit('tool_execution_start', {toolName:'ask_user_question',toolCallId:'q'});
+  pi.emit('ui_prompt_end');
+  assert.equal(snapshot().state, 'asking');
+  pi.emit('tool_execution_end', {toolCallId:'q'});
+  bus.emit('subagents:started', {id:'a', type:'Explore', status:'running'});
+  bus.emit('subagents:started', {id:'b', description:'Nested', parentAgentId:'a', status:'running'});
+  pi.emit('agent_settled', {});
+  assert.deepEqual(snapshot().rows.map(r=>[r.depth,r.state]), [[0,'idle'],[1,'working'],[2,'working']]);
+  bus.emit('subagents:failed', {id:'b',status:'error',parentAgentId:'a'});
+  assert.equal(snapshot().state, 'error');
+  bus.emit('subagents:completed', {id:'a'});
+  pi.emit('agent_start');
+  pi.emit('agent_end', {messages:[{role:'assistant',stopReason:'error'}]});
+  pi.emit('agent_settled', {});
+  assert.equal(snapshot().state, 'error');
+  pi.emit('session_shutdown');
+  assert.deepEqual(snapshot(), {state:'idle', rows:[]});
+});
